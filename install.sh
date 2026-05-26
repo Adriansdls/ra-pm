@@ -6,11 +6,16 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${RA_PYTHON:-python3}"
+VENV="$SCRIPT_DIR/.venv"
 
 echo "ra-pm: installing..."
 
-# 1. Dependencies
-"$PYTHON" -m pip install -q -r "$SCRIPT_DIR/requirements.txt"
+# 1. Create venv if needed and install dependencies
+if [ ! -f "$VENV/bin/python" ]; then
+    "$PYTHON" -m venv "$VENV"
+fi
+"$VENV/bin/pip" install -q -r "$SCRIPT_DIR/requirements.txt"
+PYTHON="$VENV/bin/python"
 
 # 2. MCP server
 claude mcp add ra-pm "$PYTHON" "$SCRIPT_DIR/server.py"
@@ -18,7 +23,7 @@ echo "  ✓ MCP server registered (ra-pm)"
 
 # 3. UserPromptSubmit hook
 SETTINGS="$HOME/.claude/settings.json"
-HOOK_CMD="$PYTHON $SCRIPT_DIR/hook.py"
+HOOK_CMD="$VENV/bin/python $SCRIPT_DIR/hook.py"
 
 if [ ! -f "$SETTINGS" ]; then
     echo '{}' > "$SETTINGS"
