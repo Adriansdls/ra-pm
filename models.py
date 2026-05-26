@@ -132,3 +132,135 @@ class InboxIdea(BaseModel):
     suggested_project: Optional[str]  = None
     routing_reason:    Optional[str]  = None
     suggested_priority: Optional[str] = None
+
+
+# ── v2: learning system models ────────────────────────────────────────────────
+
+class BetStatus(str, Enum):
+    active      = "active"
+    validated   = "validated"
+    invalidated = "invalidated"
+    paused      = "paused"
+
+
+class ExperimentStatus(str, Enum):
+    running   = "running"
+    completed = "completed"
+    paused    = "paused"
+    abandoned = "abandoned"
+
+
+class NorthStar(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    metric:             str
+    current:            Optional[float] = None
+    target:             float
+    timeframe:          str
+    why_this_metric:    str
+    leading_indicators: list[str] = []
+    updated:            date = Field(default_factory=date.today)
+
+    @field_validator("why_this_metric")
+    @classmethod
+    def why_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("why_this_metric is required")
+        return v
+
+
+class TheoryOfChange(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    inputs:      list[str]
+    activities:  list[str]
+    outputs:     list[str]
+    outcomes:    list[str]
+    impact:      str
+    assumptions: list[str]
+    updated:     date = Field(default_factory=date.today)
+
+    @field_validator("assumptions")
+    @classmethod
+    def assumptions_not_empty(cls, v: list) -> list:
+        if not v:
+            raise ValueError("assumptions required — what must be true for the causal chain to hold?")
+        return v
+
+
+class Bet(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    id:              int
+    statement:       str
+    rationale:       str
+    confidence:      float = Field(ge=0.0, le=1.0)
+    evidence_needed: str
+    status:          BetStatus = BetStatus.active
+    created:         date = Field(default_factory=date.today)
+    updated:         date = Field(default_factory=date.today)
+    updates:         list[dict] = []  # log of confidence changes
+
+    @field_validator("rationale", "evidence_needed")
+    @classmethod
+    def required_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("field is required")
+        return v
+
+
+class Experiment(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    id:               int
+    hypothesis:       str
+    bet_id:           int
+    method:           str
+    expected_learning: str
+    status:           ExperimentStatus = ExperimentStatus.running
+    started:          date = Field(default_factory=date.today)
+    completed:        Optional[date] = None
+
+    @field_validator("hypothesis", "method", "expected_learning")
+    @classmethod
+    def required_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("field is required")
+        return v
+
+
+class Finding(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    id:               int
+    experiment_id:    int
+    result:           str
+    implication:      str
+    confidence_delta: float
+    source:           str
+    logged:           date = Field(default_factory=date.today)
+
+    @field_validator("implication", "result")
+    @classmethod
+    def required_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("field is required")
+        return v
+
+
+class Decision(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    id:                    int
+    decision:              str
+    rationale:             str
+    alternatives_rejected: list[str] = []
+    bets_affected:         list[int] = []
+    logged:                date = Field(default_factory=date.today)
+
+    @field_validator("rationale", "decision")
+    @classmethod
+    def required_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("field is required")
+        return v

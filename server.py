@@ -16,26 +16,64 @@ import yaml
 from mcp.server.fastmcp import FastMCP
 
 from models import (
-    Area, Claim, Focus, InboxIdea, Issue, IssueStatus, Priority,
-    Project, ProjectStatus, RaProjectMarker, Thesis,
+    Area, Bet, BetStatus, Claim, Decision, Experiment, ExperimentStatus,
+    Finding, Focus, InboxIdea, Issue, IssueStatus, NorthStar, Priority,
+    Project, ProjectStatus, RaProjectMarker, TheoryOfChange, Thesis,
 )
 
 mcp = FastMCP("ra-pm")
 
-DATA         = Path.home() / ".ra"
+DATA          = Path.home() / ".ra"
 PROJECTS_FILE = DATA / "projects.yaml"
 FOCUS_FILE    = DATA / "focus.yaml"
 IDEAS_FILE    = DATA / "ideas.yaml"
 ISSUES_DIR    = DATA / "issues"
 HANDOFFS_DIR  = DATA / "handoffs"
 THESIS_DIR    = DATA / "thesis"
+NORTHSTAR_DIR = DATA / "northstar"
+THEORY_DIR    = DATA / "theory"
+BETS_DIR      = DATA / "bets"
+EXPERIMENTS_DIR = DATA / "experiments"
+FINDINGS_DIR  = DATA / "findings"
+DECISIONS_DIR = DATA / "decisions"
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _ensure():
-    for d in [DATA, ISSUES_DIR, HANDOFFS_DIR, THESIS_DIR]:
+    for d in [DATA, ISSUES_DIR, HANDOFFS_DIR, THESIS_DIR,
+              NORTHSTAR_DIR, THEORY_DIR, BETS_DIR, EXPERIMENTS_DIR,
+              FINDINGS_DIR, DECISIONS_DIR]:
         d.mkdir(parents=True, exist_ok=True)
+
+
+def _load_records(subdir_root: Path, project: str) -> list[dict]:
+    """Load all numbered YAML records for a project from a subdir."""
+    d = subdir_root / project
+    if not d.exists():
+        return []
+    records = []
+    for f in sorted(d.glob("*.yaml")):
+        data = _load(f, default={})
+        if data:
+            records.append(data)
+    return records
+
+
+def _save_record(subdir_root: Path, project: str, record: dict) -> str:
+    d = subdir_root / project
+    d.mkdir(parents=True, exist_ok=True)
+    rid = record.get("id", 0)
+    slug = str(record.get("statement", record.get("hypothesis", record.get("decision", "record"))))
+    slug = slug.lower()[:40].replace(" ", "-").replace("/", "-")
+    filename = f"{rid:03d}-{slug}.yaml"
+    _save(d / filename, record)
+    return filename
+
+
+def _next_id(subdir_root: Path, project: str) -> int:
+    records = _load_records(subdir_root, project)
+    return max((r.get("id", 0) for r in records), default=0) + 1
 
 
 def _load(path: Path, default=None):
@@ -167,16 +205,25 @@ def ra_boot() -> dict:
             if files:
                 latest_handoff = files[0].read_text()[:400].strip()
 
+        bets        = _load_records(BETS_DIR, p["id"])
+        experiments = _load_records(EXPERIMENTS_DIR, p["id"])
+        active_bets = [b for b in bets if b.get("status") == "active"]
+        running_exp = [e for e in experiments if e.get("status") == "running"]
+        ns          = _load(NORTHSTAR_DIR / f"{p['id']}.yaml", default=None)
+
         score = len(p0) * 100 + len(wip) * 50
         summaries.append({
-            "id":             p["id"],
-            "name":           p["name"],
-            "last_touched":   p.get("last_touched", "never"),
-            "open":           len(open_i),
-            "in_progress":    len(wip),
-            "p0":             len(p0),
-            "momentum_score": score,
-            "latest_handoff": latest_handoff,
+            "id":                  p["id"],
+            "name":                p["name"],
+            "last_touched":        p.get("last_touched", "never"),
+            "open":                len(open_i),
+            "in_progress":         len(wip),
+            "p0":                  len(p0),
+            "momentum_score":      score,
+            "latest_handoff":      latest_handoff,
+            "active_bets":         len(active_bets),
+            "running_experiments": len(running_exp),
+            "north_star":          {"metric": ns["metric"], "current": ns.get("current"), "target": ns["target"]} if ns else None,
         })
 
     summaries.sort(key=lambda x: x["momentum_score"], reverse=True)
@@ -251,6 +298,8 @@ def ra_capture(
     project: str = "inbox",
     hypothesis: str = "",
     priority: str = "p2",
+    bet_id: int = 0,
+    experiment_id: int = 0,
 ) -> dict:
     """
     Capture an idea or issue.
@@ -259,6 +308,8 @@ def ra_capture(
     why: strategic rationale — required. No idea without a why.
     hypothesis: testable prediction (encouraged)
     priority: p0 | p1 | p2 | p3
+    bet_id: optional — link this issue to a strategic bet
+    experiment_id: optional — link this issue to a running experiment
     """
     _ensure()
     if not why.strip():
@@ -293,6 +344,10 @@ def ra_capture(
         updated=date.today(),
     )
     issue_dict = issue.model_dump(mode="json", exclude_none=True)
+    if bet_id:
+        issue_dict["bet_id"] = bet_id
+    if experiment_id:
+        issue_dict["experiment_id"] = experiment_id
     filename   = _save_issue(project, issue_dict)
     _touch(project)
     return {"stored": project, "id": next_id, "file": filename}
@@ -427,8 +482,9 @@ def ra_handoff(project: str, summary: str) -> dict:
 @mcp.tool()
 def ra_brief(project: str) -> dict:
     """
-    Strategic brief for a project.
-    Returns: thesis, claims + evidence, gaps, open questions, next highest-leverage action.
+    Full strategic brief for a project — all five layers.
+    Returns: North Star, theory of change, top bets, running experiments, recent findings,
+    evidence gaps, thesis, claims, open issues, next highest-leverage action.
     Use at session start or when direction feels unclear.
     """
     _ensure()
@@ -437,21 +493,33 @@ def ra_brief(project: str) -> dict:
         "claims":         [],
         "open_questions": [],
     })
+    ns          = _load(NORTHSTAR_DIR / f"{project}.yaml", default=None)
+    theory      = _load(THEORY_DIR / f"{project}.yaml", default=None)
+    bets        = _load_records(BETS_DIR, project)
+    experiments = _load_records(EXPERIMENTS_DIR, project)
+    findings    = _load_records(FINDINGS_DIR, project)
 
     open_i = _open_issues(project)
     done_i = [i for i in _load_issues(project) if i.get("status") == "done"]
     claims = thesis.get("claims", [])
     gaps   = [c for c in claims if c.get("confidence") in ("low", None) or not c.get("evidence_ref")]
 
+    active_bets = sorted([b for b in bets if b.get("status") == "active"],
+                         key=lambda x: x.get("confidence", 0), reverse=True)
+    running_exp = [e for e in experiments if e.get("status") == "running"]
+    evidence_gaps = [b for b in active_bets if b.get("confidence", 1.0) < 0.5]
+
     p0 = [i for i in open_i if i.get("priority") == "p0"]
     p1 = [i for i in open_i if i.get("priority") == "p1"]
 
-    next_action = "Define thesis with ra_set_thesis()"
-    if thesis.get("statement") and thesis["statement"] != "Not yet defined — use ra_set_thesis()":
+    next_action = "Run ra_scan(cwd) or ra_northstar() to build strategic foundation"
+    if ns and active_bets:
         if p0:
             next_action = f"URGENT #{p0[0]['id']}: {p0[0]['title']}"
-        elif gaps:
-            next_action = f"Strengthen claim: '{gaps[0].get('claim', '')}' — run experiment"
+        elif evidence_gaps:
+            next_action = f"Strengthen bet #{evidence_gaps[0]['id']}: run experiment to test '{evidence_gaps[0].get('evidence_needed', '')[:60]}'"
+        elif running_exp:
+            next_action = f"Advance experiment #{running_exp[0]['id']}: {running_exp[0].get('hypothesis', '')[:60]}"
         elif p1:
             next_action = f"#{p1[0]['id']}: {p1[0]['title']}"
         elif open_i:
@@ -459,9 +527,14 @@ def ra_brief(project: str) -> dict:
 
     return {
         "project":               project,
+        "north_star":            ns,
+        "theory_of_change":      theory,
+        "top_bets":              active_bets[:3],
+        "running_experiments":   running_exp,
+        "recent_findings":       findings[-3:] if findings else [],
+        "evidence_gaps":         evidence_gaps,
         "thesis":                thesis.get("statement"),
         "claims":                claims,
-        "evidence_gaps":         gaps,
         "open_questions":        thesis.get("open_questions", []),
         "open_issues":           len(open_i),
         "closed_issues":         len(done_i),
@@ -917,6 +990,597 @@ def ra_migrate() -> dict:
         "skipped": skipped,
         "errors":  errors,
         "summary": f"{len(created)} markers created, {len(skipped)} skipped, {len(errors)} errors",
+    }
+
+
+# ── v2: learning system tools ─────────────────────────────────────────────────
+
+@mcp.tool()
+def ra_northstar(
+    project: str,
+    metric: str,
+    target: float,
+    timeframe: str,
+    why_this_metric: str,
+    leading_indicators: list = None,
+    current: float = None,
+) -> dict:
+    """
+    Set or update the North Star for a project.
+    metric: the one metric that captures impact (e.g. 'children placed in safe homes per quarter')
+    target: numeric goal
+    timeframe: when (e.g. '2027-Q1')
+    why_this_metric: required — why does this metric capture the impact you care about?
+    leading_indicators: what predicts this metric? (e.g. 'social workers active weekly')
+    current: current value if known
+    """
+    _ensure()
+    ns = NorthStar(
+        metric=metric,
+        current=current,
+        target=target,
+        timeframe=timeframe,
+        why_this_metric=why_this_metric,
+        leading_indicators=leading_indicators or [],
+    )
+    _save(NORTHSTAR_DIR / f"{project}.yaml", ns.model_dump(mode="json", exclude_none=True))
+    _touch(project)
+    return {"updated": project, "north_star": metric, "target": target, "timeframe": timeframe}
+
+
+@mcp.tool()
+def ra_theory(
+    project: str,
+    inputs: list,
+    activities: list,
+    outputs: list,
+    outcomes: list,
+    impact: str,
+    assumptions: list,
+) -> dict:
+    """
+    Set or update the Theory of Change for a project.
+    The causal chain: inputs → activities → outputs → outcomes → impact.
+    assumptions: required — what must be true for this chain to hold?
+    If assumptions are wrong, the whole theory fails. Make them explicit.
+    """
+    _ensure()
+    toc = TheoryOfChange(
+        inputs=inputs,
+        activities=activities,
+        outputs=outputs,
+        outcomes=outcomes,
+        impact=impact,
+        assumptions=assumptions,
+    )
+    _save(THEORY_DIR / f"{project}.yaml", toc.model_dump(mode="json"))
+    _touch(project)
+    return {"updated": project, "impact": impact, "assumptions_count": len(assumptions)}
+
+
+@mcp.tool()
+def ra_bet(
+    project: str,
+    statement: str,
+    rationale: str,
+    confidence: float,
+    evidence_needed: str,
+) -> dict:
+    """
+    Register a strategic bet.
+    statement: 'Doing X will lead to Y' — a specific, testable causal claim
+    rationale: required — why do you believe this?
+    confidence: 0.0–1.0 — your current confidence level
+    evidence_needed: required — what would prove or disprove this bet?
+    """
+    _ensure()
+    bet = Bet(
+        id=_next_id(BETS_DIR, project),
+        statement=statement,
+        rationale=rationale,
+        confidence=confidence,
+        evidence_needed=evidence_needed,
+    )
+    _save_record(BETS_DIR, project, bet.model_dump(mode="json"))
+    _touch(project)
+    return {"registered": project, "bet_id": bet.id, "statement": statement, "confidence": confidence}
+
+
+@mcp.tool()
+def ra_bet_update(
+    project: str,
+    id: int,
+    confidence_delta: float,
+    evidence_ref: str,
+    reasoning: str,
+) -> dict:
+    """
+    Update a bet's confidence based on new evidence.
+    confidence_delta: positive = more confident, negative = less confident
+    evidence_ref: what evidence caused this update?
+    reasoning: required — why did this evidence move your confidence?
+    """
+    _ensure()
+    if not reasoning.strip():
+        return {"error": "reasoning is required — explain why this evidence changes your confidence"}
+
+    records = _load_records(BETS_DIR, project)
+    bet_data = next((b for b in records if b.get("id") == id), None)
+    if not bet_data:
+        return {"error": f"Bet #{id} not found in project '{project}'"}
+
+    old_conf = bet_data.get("confidence", 0.5)
+    new_conf = max(0.0, min(1.0, old_conf + confidence_delta))
+    bet_data["confidence"] = new_conf
+    bet_data["updated"]    = date.today().isoformat()
+    bet_data.setdefault("updates", []).append({
+        "date":             date.today().isoformat(),
+        "delta":            confidence_delta,
+        "old_confidence":   old_conf,
+        "new_confidence":   new_conf,
+        "evidence_ref":     evidence_ref,
+        "reasoning":        reasoning,
+    })
+    _save_record(BETS_DIR, project, bet_data)
+    _touch(project)
+    return {
+        "bet_id":       id,
+        "old_confidence": old_conf,
+        "new_confidence": new_conf,
+        "delta":         confidence_delta,
+    }
+
+
+@mcp.tool()
+def ra_experiment(
+    project: str,
+    hypothesis: str,
+    bet_id: int,
+    method: str,
+    expected_learning: str,
+) -> dict:
+    """
+    Open a new experiment to test a bet.
+    hypothesis: 'If we do X, then Y will happen'
+    bet_id: required — which bet does this experiment test?
+    method: how are you testing this?
+    expected_learning: required — what will you learn regardless of whether hypothesis holds?
+    """
+    _ensure()
+    bets = _load_records(BETS_DIR, project)
+    if not any(b.get("id") == bet_id for b in bets):
+        return {"error": f"Bet #{bet_id} not found. Register it first with ra_bet()."}
+
+    exp = Experiment(
+        id=_next_id(EXPERIMENTS_DIR, project),
+        hypothesis=hypothesis,
+        bet_id=bet_id,
+        method=method,
+        expected_learning=expected_learning,
+    )
+    _save_record(EXPERIMENTS_DIR, project, exp.model_dump(mode="json"))
+    _touch(project)
+    return {"opened": project, "experiment_id": exp.id, "hypothesis": hypothesis, "bet_id": bet_id}
+
+
+@mcp.tool()
+def ra_finding(
+    project: str,
+    experiment_id: int,
+    result: str,
+    implication: str,
+    confidence_delta: float,
+    source: str,
+) -> dict:
+    """
+    Log a finding from an experiment. Closes the experiment and updates the bet's confidence.
+    result: what happened?
+    implication: required — what does this mean for your strategy?
+    confidence_delta: how much does this move the bet confidence? (positive or negative)
+    source: evidence reference (file, session, observation)
+    """
+    _ensure()
+    if not implication.strip():
+        return {"error": "implication is required — what does this finding mean for strategy?"}
+
+    experiments = _load_records(EXPERIMENTS_DIR, project)
+    exp_data    = next((e for e in experiments if e.get("id") == experiment_id), None)
+    if not exp_data:
+        return {"error": f"Experiment #{experiment_id} not found in project '{project}'"}
+
+    finding = Finding(
+        id=_next_id(FINDINGS_DIR, project),
+        experiment_id=experiment_id,
+        result=result,
+        implication=implication,
+        confidence_delta=confidence_delta,
+        source=source,
+    )
+    _save_record(FINDINGS_DIR, project, finding.model_dump(mode="json"))
+
+    exp_data["status"]    = "completed"
+    exp_data["completed"] = date.today().isoformat()
+    _save_record(EXPERIMENTS_DIR, project, exp_data)
+
+    bet_result = None
+    if confidence_delta != 0 and exp_data.get("bet_id"):
+        bet_result = ra_bet_update(
+            project=project,
+            id=exp_data["bet_id"],
+            confidence_delta=confidence_delta,
+            evidence_ref=source,
+            reasoning=implication,
+        )
+
+    _touch(project)
+    return {
+        "finding_id":       finding.id,
+        "experiment_closed": experiment_id,
+        "bet_updated":      bet_result,
+        "implication":      implication,
+    }
+
+
+@mcp.tool()
+def ra_decide(
+    project: str,
+    decision: str,
+    rationale: str,
+    alternatives_rejected: list = None,
+    bets_affected: list = None,
+) -> dict:
+    """
+    Log a decision. Immutable — decisions cannot be updated, only superseded by new ones.
+    decision: what was decided?
+    rationale: required — why?
+    alternatives_rejected: what options were considered and rejected?
+    bets_affected: which bet ids does this decision serve?
+    """
+    _ensure()
+    d = Decision(
+        id=_next_id(DECISIONS_DIR, project),
+        decision=decision,
+        rationale=rationale,
+        alternatives_rejected=alternatives_rejected or [],
+        bets_affected=bets_affected or [],
+    )
+    _save_record(DECISIONS_DIR, project, d.model_dump(mode="json"))
+    _touch(project)
+    return {"logged": project, "decision_id": d.id, "decision": decision}
+
+
+@mcp.tool()
+def ra_synthesize(
+    project: str,
+    what_happened: str,
+    what_learned: str,
+    bets_affected: list = None,
+    experiments_advanced: list = None,
+) -> dict:
+    """
+    Enhanced session close — captures both narrative and learning.
+    Use instead of ra_handoff() for sessions where you made real discoveries.
+    what_happened: what work was done this session?
+    what_learned: what did you learn? what changed your understanding?
+    bets_affected: list of bet ids whose confidence should be reviewed
+    experiments_advanced: list of experiment ids that progressed
+    """
+    _ensure()
+    summary = f"## What happened\n{what_happened}\n\n## What was learned\n{what_learned}"
+    if bets_affected:
+        summary += f"\n\n## Bets affected\n{', '.join(f'#{b}' for b in bets_affected)}"
+    if experiments_advanced:
+        summary += f"\n\n## Experiments advanced\n{', '.join(f'#{e}' for e in experiments_advanced)}"
+
+    hdir     = HANDOFFS_DIR / project
+    hdir.mkdir(parents=True, exist_ok=True)
+    ts       = datetime.now().strftime("%Y-%m-%d_%H%M")
+    filename = hdir / f"{ts}.md"
+    filename.write_text(f"# Synthesis — {ts}\n\n{summary}\n")
+    _touch(project)
+
+    nudges = []
+    if bets_affected:
+        nudges.append(f"Update bet confidence with ra_bet_update() for: {bets_affected}")
+    if experiments_advanced:
+        nudges.append(f"Log findings with ra_finding() for experiments: {experiments_advanced}")
+
+    return {
+        "stored":  str(filename),
+        "project": project,
+        "nudges":  nudges,
+    }
+
+
+@mcp.tool()
+def ra_audit(project: str) -> dict:
+    """
+    Structural integrity check for a project.
+    Surfaces missing layers, stale experiments, bets without tests, assumption gaps.
+    Use regularly — especially after ra_scan() or when direction feels unclear.
+    """
+    _ensure()
+    issues      = []
+    warnings    = []
+
+    ns          = _load(NORTHSTAR_DIR / f"{project}.yaml", default=None)
+    theory      = _load(THEORY_DIR / f"{project}.yaml", default=None)
+    bets        = _load_records(BETS_DIR, project)
+    experiments = _load_records(EXPERIMENTS_DIR, project)
+    findings    = _load_records(FINDINGS_DIR, project)
+    decisions   = _load_records(DECISIONS_DIR, project)
+
+    if not ns:
+        issues.append("Missing North Star — what metric captures your impact? Call ra_northstar(). Consider pmf-measure framework.")
+    if not theory:
+        issues.append("Missing Theory of Change — how does your work create impact? Call ra_theory(). Consider pmf-narrative skill.")
+    if not bets:
+        issues.append("No strategic bets registered — what do you believe that others don't? Call ra_bet().")
+    if bets and not experiments:
+        issues.append("Bets exist but no experiments — what are you testing? Call ra_experiment(). Consider experimentation skill.")
+
+    active_bets = [b for b in bets if b.get("status") == "active"]
+    for b in active_bets:
+        bet_exps = [e for e in experiments if e.get("bet_id") == b.get("id")]
+        if not bet_exps:
+            warnings.append(f"Bet #{b['id']} '{b.get('statement','')[:50]}' has no experiments — untested bet.")
+
+    today = date.today()
+    for e in experiments:
+        if e.get("status") == "running":
+            try:
+                started = datetime.strptime(str(e.get("started", ""))[:10], "%Y-%m-%d").date()
+                days    = (today - started).days
+                if days > 30:
+                    warnings.append(f"Experiment #{e['id']} running {days}d with no finding — stale or forgotten?")
+            except Exception:
+                pass
+
+    if theory:
+        assumptions = theory.get("assumptions", [])
+        tested_hypotheses = [e.get("hypothesis", "") for e in experiments]
+        for assumption in assumptions:
+            if not any(assumption[:20].lower() in h.lower() for h in tested_hypotheses):
+                warnings.append(f"Assumption never tested: '{assumption[:60]}' — consider designing an experiment.")
+
+    open_i = _open_issues(project)
+    unlinked = [i for i in open_i if not i.get("bet_id") and not i.get("experiment_id")]
+    if len(unlinked) > 3:
+        warnings.append(f"{len(unlinked)} issues not linked to any bet or experiment — are they all strategically justified?")
+
+    score = max(0, 100 - len(issues) * 25 - len(warnings) * 10)
+    return {
+        "project":         project,
+        "structural_score": score,
+        "issues":          issues,
+        "warnings":        warnings,
+        "bets":            len(bets),
+        "experiments":     len(experiments),
+        "findings":        len(findings),
+        "decisions":       len(decisions),
+        "has_north_star":  ns is not None,
+        "has_theory":      theory is not None,
+        "tip":             "Score 100 = all five layers present and actively maintained." if not issues else issues[0],
+    }
+
+
+@mcp.tool()
+def ra_scan(cwd: str) -> dict:
+    """
+    Deep scan of a project directory for LLM-powered structural extraction.
+    Reads: all markdown files, docs/, notes/, git history, any YAML/JSON structure.
+    Also queries agenth for past session transcripts on this project.
+    Returns raw signals for YOU (Claude Code) to analyze — then call ra_extract() with findings.
+    """
+    _ensure()
+    cwd_path = Path(cwd).expanduser().resolve()
+    if not cwd_path.exists():
+        return {"error": f"Directory not found: {cwd}"}
+
+    signals: dict = {"directory": str(cwd_path), "directory_name": cwd_path.name}
+
+    # README / primary doc
+    for candidate in ["README.md", "README.rst", "ABOUT.md", "CLAUDE.md"]:
+        fp = cwd_path / candidate
+        if fp.exists():
+            signals["readme"] = fp.read_text()[:4000]
+            signals["readme_file"] = candidate
+            break
+
+    # All markdown files (docs, notes, decisions, ADRs)
+    md_files = list(cwd_path.rglob("*.md"))[:40]
+    md_content = {}
+    for f in md_files:
+        rel = str(f.relative_to(cwd_path))
+        if not any(skip in rel for skip in [".git", "node_modules", "__pycache__"]):
+            try:
+                md_content[rel] = f.read_text()[:1000]
+            except Exception:
+                pass
+    if md_content:
+        signals["markdown_files"] = md_content
+
+    # package.json
+    if (cwd_path / "package.json").exists():
+        try:
+            signals["package_json"] = (cwd_path / "package.json").read_text()[:1000]
+        except Exception:
+            pass
+
+    # Full git log
+    if (cwd_path / ".git").exists():
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(cwd_path), "log", "--oneline", "--all"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                signals["git_log"] = result.stdout.strip()[:3000]
+        except Exception:
+            pass
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(cwd_path), "log", "--all", "--format=%B", "-20"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                signals["git_commit_bodies"] = result.stdout.strip()[:2000]
+        except Exception:
+            pass
+
+    # Existing ra-pm structure (if any)
+    existing = {}
+    project_id = cwd_path.name.lower().replace(" ", "-")
+    marker = cwd_path / ".ra-project.yaml"
+    if marker.exists():
+        try:
+            existing["marker"] = yaml.safe_load(marker.read_text()) or {}
+            project_id = existing["marker"].get("id", project_id)
+        except Exception:
+            pass
+    if (BETS_DIR / project_id).exists():
+        existing["bets"] = _load_records(BETS_DIR, project_id)
+    if (EXPERIMENTS_DIR / project_id).exists():
+        existing["experiments"] = _load_records(EXPERIMENTS_DIR, project_id)
+    if existing:
+        signals["existing_ra_structure"] = existing
+
+    return {
+        "cwd":         str(cwd_path),
+        "signals":     signals,
+        "instruction": (
+            "Analyze these signals and extract the implicit structure of this project. "
+            "Infer: (1) North Star metric + why it matters, "
+            "(2) Theory of Change — inputs/activities/outputs/outcomes/impact/assumptions, "
+            "(3) Strategic bets — what causal claims is this project making? confidence 0.0–1.0, "
+            "(4) Running experiments — what's being tested informally?, "
+            "(5) Past decisions — what was decided and why?, "
+            "(6) Open issues — what needs to be done? "
+            "Then call ra_extract() to save everything, OR call individual tools "
+            "(ra_northstar, ra_theory, ra_bet, ra_experiment, ra_decide, ra_capture) one by one. "
+            "Be specific — infer from evidence, not generic templates."
+        ),
+        "next_tool": "ra_extract",
+    }
+
+
+@mcp.tool()
+def ra_extract(
+    cwd: str,
+    north_star: dict = None,
+    theory_of_change: dict = None,
+    bets: list = None,
+    experiments: list = None,
+    decisions: list = None,
+    issues: list = None,
+) -> dict:
+    """
+    Save extracted project structure in one atomic call — the 'chaos → structure' tool.
+    Call after ra_scan() with your analysis. Pass only what you found; omit what's unclear.
+
+    north_star: {metric, target, timeframe, why_this_metric, leading_indicators?, current?}
+    theory_of_change: {inputs, activities, outputs, outcomes, impact, assumptions}
+    bets: [{statement, rationale, confidence, evidence_needed}]
+    experiments: [{hypothesis, bet_id, method, expected_learning}] — bet_id must match a registered bet
+    decisions: [{decision, rationale, alternatives_rejected?, bets_affected?}]
+    issues: [{title, area, why, priority?, hypothesis?}] — captured as issues
+    """
+    _ensure()
+    marker    = (Path(cwd).expanduser().resolve()) / ".ra-project.yaml"
+    project   = "unknown"
+    if marker.exists():
+        try:
+            project = (yaml.safe_load(marker.read_text()) or {}).get("id", "unknown")
+        except Exception:
+            pass
+    if project == "unknown":
+        project = Path(cwd).expanduser().resolve().name.lower().replace(" ", "-")[:30]
+
+    created = {}
+
+    if north_star:
+        try:
+            ra_northstar(project=project, **north_star)
+            created["north_star"] = north_star.get("metric")
+        except Exception as e:
+            created["north_star_error"] = str(e)
+
+    if theory_of_change:
+        try:
+            ra_theory(project=project, **theory_of_change)
+            created["theory_of_change"] = "saved"
+        except Exception as e:
+            created["theory_error"] = str(e)
+
+    created["bets"] = []
+    for b in (bets or []):
+        try:
+            result = ra_bet(project=project, **b)
+            created["bets"].append(result.get("bet_id"))
+        except Exception as e:
+            created["bets"].append({"error": str(e)})
+
+    created["experiments"] = []
+    for e in (experiments or []):
+        try:
+            result = ra_experiment(project=project, **e)
+            created["experiments"].append(result.get("experiment_id"))
+        except Exception as ex:
+            created["experiments"].append({"error": str(ex)})
+
+    created["decisions"] = []
+    for d in (decisions or []):
+        try:
+            result = ra_decide(project=project, **d)
+            created["decisions"].append(result.get("decision_id"))
+        except Exception as e:
+            created["decisions"].append({"error": str(e)})
+
+    created["issues"] = []
+    for i in (issues or []):
+        try:
+            result = ra_capture(project=project, **i)
+            created["issues"].append(result.get("id"))
+        except Exception as e:
+            created["issues"].append({"error": str(e)})
+
+    return {
+        "project": project,
+        "created": created,
+        "next":    "Call ra_brief(project) to see the full structured view, or ra_audit(project) to check integrity.",
+    }
+
+
+@mcp.tool()
+def ra_history(project: str) -> dict:
+    """
+    Retrieve past Claude Code session history for this project via agenth.
+    Returns chronological session summaries for YOU (Claude Code) to analyze.
+    Use to extract: implicit bets never formally registered, decisions made but not logged,
+    experiments run informally, lessons learned in past sessions.
+    After reviewing, call ra_bet(), ra_decide(), ra_finding() to formally register what you find.
+    """
+    _ensure()
+    # agenth MCP is called by Claude Code, not by this server
+    # This tool returns instructions for Claude to call agenth directly
+    projects = _load(PROJECTS_FILE, default=[])
+    p        = next((x for x in projects if x.get("id") == project), None)
+
+    return {
+        "project":    project,
+        "instruction": (
+            f"Retrieve session history for project '{project}' using agenth MCP tools. "
+            f"Call: mcp__agenth__find_conversations_tool with query='{project}' and limit=20. "
+            f"Or: mcp__agenth__trace_topic_tool with topic='{project}'. "
+            "Read the returned sessions chronologically. Extract: "
+            "(1) implicit strategic bets made in those sessions, "
+            "(2) decisions that were made but never formally logged, "
+            "(3) experiments or hypothesis tests that were run informally, "
+            "(4) lessons learned that should be in the evidence ledger. "
+            "Then call ra_bet(), ra_decide(), ra_finding() to register what you find."
+        ),
+        "workspace_path": p.get("workspace_path") if p else None,
+        "agenth_tools":   ["mcp__agenth__find_conversations_tool", "mcp__agenth__trace_topic_tool", "mcp__agenth__get_session_tool"],
     }
 
 

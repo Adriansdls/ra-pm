@@ -61,6 +61,24 @@ def momentum_bar(days: int) -> str:
     return               "░░░░░░░░░░"
 
 
+def _load_records_hook(subdir_root: Path, project: str) -> list[dict]:
+    d = subdir_root / project
+    if not d.exists():
+        return []
+    records = []
+    for f in sorted(d.glob("*.yaml")):
+        r = _load(f)
+        if r:
+            records.append(r)
+    return records
+
+
+def _load_northstar(project_id: str) -> dict | None:
+    path = DATA / "northstar" / f"{project_id}.yaml"
+    d = _load(path)
+    return d if d else None
+
+
 def detect_project(cwd: Path) -> str | None:
     """Walk up from cwd to home looking for .ra-project.yaml. Returns project id or None."""
     home = Path.home()
@@ -91,11 +109,15 @@ def project_briefing(project_id: str) -> list[str]:
     if not p:
         return []
 
-    open_i = _open_issues(project_id)
-    wip    = [i for i in open_i if i.get("status") == "in-progress"]
-    p0     = [i for i in open_i if i.get("priority") == "p0"]
-    p1     = [i for i in open_i if i.get("priority") == "p1"]
-    days   = days_ago(p.get("last_touched", "never"))
+    open_i      = _open_issues(project_id)
+    wip         = [i for i in open_i if i.get("status") == "in-progress"]
+    p0          = [i for i in open_i if i.get("priority") == "p0"]
+    p1          = [i for i in open_i if i.get("priority") == "p1"]
+    days        = days_ago(p.get("last_touched", "never"))
+    ns          = _load_northstar(project_id)
+    bets        = _load_records_hook(DATA / "bets", project_id)
+    experiments = _load_records_hook(DATA / "experiments", project_id)
+    findings    = _load_records_hook(DATA / "findings", project_id)
 
     latest_handoff = None
     hdir = DATA / "handoffs" / project_id
@@ -111,6 +133,52 @@ def project_briefing(project_id: str) -> list[str]:
     # Focus
     if focus.get("project") == project_id and focus.get("issue_title"):
         out.append(f"FOCUS  #{focus.get('issue_id', '?')} {focus['issue_title']}")
+        out.append("")
+
+    # North Star
+    if ns:
+        current_str = f"now: {ns['current']}  →  " if ns.get("current") is not None else ""
+        out.append(f"NORTH STAR  {ns.get('metric', '')}")
+        out.append(f"            {current_str}target: {ns.get('target', '?')} ({ns.get('timeframe', '')})")
+        indicators = ns.get("leading_indicators") or []
+        if indicators:
+            out.append(f"            leading: {indicators[0]}")
+        out.append("")
+
+    # Top Bet
+    active_bets = [b for b in bets if b.get("status", "active") == "active"]
+    if active_bets:
+        top_bet = max(active_bets, key=lambda b: b.get("confidence", 0))
+        bet_exp_ids = {e.get("id") for e in experiments if e.get("bet_id") == top_bet.get("id")}
+        running_for_bet = [e for e in experiments if e.get("bet_id") == top_bet.get("id") and e.get("status", "running") == "running"]
+        bet_findings = [f for f in findings if f.get("experiment_id") in bet_exp_ids]
+        last_f_days = min((days_ago(f.get("logged")) for f in bet_findings), default=999)
+        finding_str = f"last finding {last_f_days}d ago" if last_f_days < 999 else "no findings yet"
+        n = len(running_for_bet)
+        exp_str = f"{n} experiment{'s' if n != 1 else ''} running"
+        conf = top_bet.get("confidence", 0)
+        stmt = (top_bet.get("statement") or "")[:70]
+        out.append(f"TOP BET  #{top_bet.get('id')} [{conf:.0%}]  {stmt}")
+        out.append(f"         {exp_str}  ·  {finding_str}")
+        out.append("")
+
+    # Learn Today
+    learn = []
+    running_all = [e for e in experiments if e.get("status", "running") == "running"]
+    for e in running_all[:2]:
+        hyp = (e.get("hypothesis") or "")[:60]
+        started = days_ago(e.get("started"))
+        learn.append(f"  → Exp #{e.get('id')}  \"{hyp}\"  running {started}d")
+    for b in active_bets[:3]:
+        if b.get("confidence", 0) < 0.5:
+            b_exp_ids = {e.get("id") for e in experiments if e.get("bet_id") == b.get("id")}
+            b_findings = [f for f in findings if f.get("experiment_id") in b_exp_ids]
+            if not any(days_ago(f.get("logged")) < 14 for f in b_findings):
+                ev = (b.get("evidence_needed") or "")[:60]
+                learn.append(f"  → Bet #{b.get('id')}  evidence gap — {ev}")
+    if learn:
+        out.append("LEARN TODAY")
+        out.extend(learn[:3])
         out.append("")
 
     # Urgent
@@ -145,6 +213,8 @@ def project_briefing(project_id: str) -> list[str]:
         rec = f"Start: #{p1[0].get('id')} {p1[0].get('title')}"
     elif open_i:
         rec = f"Pick up: #{open_i[0].get('id')} {open_i[0].get('title')}"
+    elif running_all:
+        rec = f"Advance experiment: #{running_all[0].get('id')} — log a finding via ra_finding()"
     else:
         rec = "No open issues — capture new work with ra_capture()"
 
