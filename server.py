@@ -7,7 +7,6 @@ Data lives in ~/.ra/ — global across all projects.
 """
 
 import json
-import os
 import subprocess
 from datetime import date, datetime
 from pathlib import Path
@@ -133,17 +132,6 @@ def _save_thesis(project_id: str, thesis: Thesis):
     data = thesis.model_dump(mode="json")
     _save(THESIS_DIR / f"{project_id}.yaml", data)
 
-
-def _llm_call(prompt: str, max_tokens: int = 1024) -> str:
-    """Call Claude via anthropic SDK. Returns raw text content."""
-    import anthropic
-    client = anthropic.Anthropic()
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response.content[0].text
 
 
 PRIORITY_RANK = {"p0": 0, "p1": 1, "p2": 2, "p3": 3}
@@ -611,9 +599,9 @@ def ra_calibrate(project: str) -> dict:
 @mcp.tool()
 def ra_inbox() -> dict:
     """
-    List all unclassified ideas in the inbox. Uses LLM to suggest project routing for each idea,
-    based on idea content + project theses. Returns ideas with routing suggestions and reasoning.
-    Use when the session briefing reports inbox ideas, or when you want to triage.
+    Returns all unclassified inbox ideas plus project theses for routing.
+    YOU (Claude Code) decide which project each idea belongs to based on the idea content
+    and project theses, then call ra_inbox_route() for each idea to confirm the assignment.
     """
     _ensure()
     ideas    = _load(IDEAS_FILE, default=[])
@@ -623,7 +611,6 @@ def ra_inbox() -> dict:
     if not inbox:
         return {"inbox_count": 0, "ideas": [], "tip": "Inbox is clear."}
 
-    # Build project context for LLM: id, name, thesis
     project_context = []
     for p in projects:
         if p.get("status") == "archived":
@@ -640,39 +627,62 @@ def ra_inbox() -> dict:
         for i in inbox
     ]
 
-    prompt = f"""You are routing unclassified project ideas to the right project.
+    return {
+        "inbox_count":    len(inbox),
+        "ideas":          ideas_payload,
+        "projects":       project_context,
+        "instruction":    (
+            "For each idea: match it against the project theses. "
+            "Call ra_inbox_route(idea_title, project_id, routing_reason, priority) for each. "
+            "Use project_id='inbox' if genuinely ambiguous."
+        ),
+    }
 
-Projects and their strategic thesis:
-{json.dumps(project_context, indent=2)}
 
-Inbox ideas to route:
-{json.dumps(ideas_payload, indent=2)}
+@mcp.tool()
+def ra_inbox_route(
+    idea_title: str,
+    project: str,
+    routing_reason: str,
+    priority: str = "p2",
+) -> dict:
+    """
+    Assign an inbox idea to a project. Call this after ra_inbox() for each idea.
+    idea_title: exact title from the inbox idea
+    project: target project id (or 'inbox' to leave unrouted)
+    routing_reason: one sentence why this project fits
+    priority: p0 | p1 | p2 | p3
+    """
+    _ensure()
+    ideas = _load(IDEAS_FILE, default=[])
+    idea  = next((i for i in ideas if i.get("title") == idea_title and i.get("project") == "inbox"), None)
+    if not idea:
+        return {"error": f"Inbox idea not found: '{idea_title}'"}
 
-For each idea, decide the best project based on the idea's content, area, and why — matched against the project theses.
+    if project == "inbox":
+        return {"status": "left_in_inbox", "title": idea_title, "reason": routing_reason}
 
-Return a JSON array with the same ideas, each augmented with:
-- "suggested_project": the project id that best fits (or "inbox" if genuinely ambiguous)
-- "routing_reason": one sentence explaining why
-- "suggested_priority": p0 | p1 | p2 | p3 based on the why and urgency signals
+    # Move from inbox to project as a captured issue
+    idea_copy = {k: v for k, v in idea.items() if k not in ("_file", "_notes")}
+    result = ra_capture(
+        title=idea_copy["title"],
+        area=idea_copy.get("area", "dev"),
+        why=idea_copy.get("why", routing_reason),
+        project=project,
+        hypothesis=idea_copy.get("hypothesis", ""),
+        priority=priority,
+    )
 
-Respond with JSON array only. No prose."""
-
-    try:
-        raw = _llm_call(prompt, max_tokens=1024)
-        # Strip possible markdown code fences
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        routed = json.loads(raw)
-    except Exception as e:
-        routed = [{**i, "routing_reason": f"LLM routing failed: {e}"} for i in ideas_payload]
+    # Remove from inbox
+    ideas[:] = [i for i in ideas if not (i.get("title") == idea_title and i.get("project") == "inbox")]
+    _save(IDEAS_FILE, ideas)
 
     return {
-        "inbox_count": len(inbox),
-        "ideas":       routed,
-        "tip":         "For each idea: call ra_capture(title, area, why, project=<suggested_project>) to move it out of inbox",
+        "status":         "routed",
+        "title":          idea_title,
+        "to_project":     project,
+        "routing_reason": routing_reason,
+        "issue":          result,
     }
 
 
@@ -718,21 +728,19 @@ def ra_stale() -> dict:
 
 
 @mcp.tool()
-def ra_init(cwd: str, name: str = "") -> dict:
+def ra_init(cwd: str) -> dict:
     """
-    Index a project directory. Uses LLM to infer project identity from README, git log, package.json.
-    Creates .ra-project.yaml marker in the project root and registers the project in ~/.ra/.
-    Call when opening an unindexed project directory for the first time.
+    Gather signals from a project directory for indexing.
+    Returns raw signals (README, git log, package.json, dir name) for YOU (Claude Code) to infer
+    the project identity from. After reading the signals, call ra_init_save() with your conclusions.
 
-    cwd: absolute path to the project directory (use the actual working directory)
-    name: optional override for the project name (LLM will infer if not given)
+    cwd: absolute path to the project directory
     """
     _ensure()
     cwd_path = Path(cwd).expanduser().resolve()
     if not cwd_path.exists():
         return {"error": f"Directory not found: {cwd}"}
 
-    # Check if already indexed
     marker_path = cwd_path / ".ra-project.yaml"
     if marker_path.exists():
         try:
@@ -741,12 +749,11 @@ def ra_init(cwd: str, name: str = "") -> dict:
                 "status":  "already_indexed",
                 "project": existing.get("id"),
                 "name":    existing.get("name"),
-                "tip":     f"Project already registered as '{existing.get('id')}'. Use ra_focus('{existing.get('id')}') to load context.",
+                "tip":     f"Already registered as '{existing.get('id')}'. Use ra_focus('{existing.get('id')}') to load context.",
             }
         except Exception:
             pass
 
-    # Gather signals
     signals: dict[str, str] = {}
     for candidate in ["README.md", "README.rst", "ABOUT.md", "CLAUDE.md"]:
         fp = cwd_path / candidate
@@ -771,78 +778,80 @@ def ra_init(cwd: str, name: str = "") -> dict:
             pass
     signals["directory_name"] = cwd_path.name
 
-    if not signals:
-        return {"error": f"No indexable signals found in {cwd}. Add a README.md or initialize git."}
+    if len(signals) <= 1:
+        return {"error": f"No indexable signals in {cwd}. Add a README.md or initialize git."}
 
-    # LLM inference
-    prompt = f"""You are indexing a software/content project directory for a personal PM system.
+    return {
+        "cwd":         str(cwd_path),
+        "signals":     signals,
+        "instruction": (
+            "Read the signals and infer: id (slug), name, description, area "
+            "(content|research|dev|ops|design|infra|strategy), thesis_statement, open_questions (2 max). "
+            "Then call ra_init_save() with your conclusions."
+        ),
+        "valid_areas": [a.value for a in Area],
+    }
 
-Raw signals from the directory:
-{json.dumps(signals, indent=2)}
 
-Infer the project's identity. Return JSON only (no prose, no markdown fences):
-{{
-  "id": "<slug, lowercase, hyphens, max 30 chars>",
-  "name": "<human readable name, 2-5 words>",
-  "description": "<1-2 sentences: what this project is and its primary goal>",
-  "area": "<one of: content | research | dev | ops | design | infra | strategy>",
-  "thesis_statement": "<one sentence: what would make this project successful — or null if unclear>",
-  "open_questions": ["<calibration question 1>", "<calibration question 2>"]
-}}"""
+@mcp.tool()
+def ra_init_save(
+    cwd: str,
+    id: str,
+    name: str,
+    description: str,
+    area: str,
+    thesis_statement: str = "",
+    open_questions: list = None,
+) -> dict:
+    """
+    Save inferred project identity. Call this after ra_init() with your conclusions.
+    Creates .ra-project.yaml in the project root, registers the project, sets thesis.
 
-    try:
-        raw = _llm_call(prompt, max_tokens=512)
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        inferred = json.loads(raw)
-    except Exception as e:
-        return {"error": f"LLM inference failed: {e}. Signals gathered: {list(signals.keys())}"}
+    cwd: same path passed to ra_init()
+    id: slug e.g. 'my-project' (lowercase, hyphens, max 30 chars)
+    name: human name e.g. 'My Project'
+    description: 1-2 sentences
+    area: content | research | dev | ops | design | infra | strategy
+    thesis_statement: one sentence — what would make this project successful
+    open_questions: up to 2 strategic unknowns
+    """
+    _ensure()
+    cwd_path = Path(cwd).expanduser().resolve()
+    if not cwd_path.exists():
+        return {"error": f"Directory not found: {cwd}"}
 
-    # Name override
-    if name.strip():
-        inferred["name"] = name.strip()
-        inferred["id"]   = name.strip().lower().replace(" ", "-")[:30]
-
-    # Validate area
     valid_areas = [a.value for a in Area]
-    if inferred.get("area") not in valid_areas:
-        inferred["area"] = "dev"
+    if area not in valid_areas:
+        area = "dev"
 
-    # Create .ra-project.yaml marker
     marker = RaProjectMarker(
-        id=inferred["id"],
-        name=inferred["name"],
-        description=inferred.get("description"),
-        area=inferred.get("area"),
+        id=id[:30],
+        name=name,
+        description=description,
+        area=area,
     )
+    marker_path = cwd_path / ".ra-project.yaml"
     marker_path.write_text(
-        "# Generated by ra_init() — do not edit by hand\n"
+        "# Generated by ra_init_save() — do not edit by hand\n"
         + yaml.dump(marker.model_dump(mode="json"), default_flow_style=False, allow_unicode=True)
     )
 
-    # Register project
     project = Project(
-        id=inferred["id"],
-        name=inferred["name"],
+        id=id[:30],
+        name=name,
         workspace_path=str(cwd_path),
-        description=inferred.get("description"),
-        area=inferred.get("area"),
+        description=description,
+        area=area,
     )
     _register_project(project)
 
-    # Set thesis if inferred
-    if inferred.get("thesis_statement"):
+    if thesis_statement.strip():
         thesis = Thesis(
-            statement=inferred["thesis_statement"],
-            open_questions=inferred.get("open_questions", []),
+            statement=thesis_statement,
+            open_questions=open_questions or [],
         )
         _save_thesis(project.id, thesis)
 
-    # Build response
-    qs = inferred.get("open_questions", [])
     result: dict = {
         "status":      "indexed",
         "project_id":  project.id,
@@ -851,11 +860,10 @@ Infer the project's identity. Return JSON only (no prose, no markdown fences):
         "area":        project.area,
         "marker":      str(marker_path),
     }
-    if qs:
-        result["calibration_questions"] = qs
-    if inferred.get("thesis_statement"):
-        result["thesis_drafted"] = inferred["thesis_statement"]
-
+    if thesis_statement.strip():
+        result["thesis"] = thesis_statement
+    if open_questions:
+        result["open_questions"] = open_questions
     return result
 
 
